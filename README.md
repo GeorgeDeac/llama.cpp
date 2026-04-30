@@ -1,4 +1,181 @@
-# llama.cpp
+# llama.cpp - `prism` fork
+
+> **This is a private fork** of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). It adds two non-upstream weight types: **Q1_0** (1-bit, BitNet-style) and **Q2_0** (2-bit asymmetric) with a set of x86 AVX-512 kernels tuned for **Intel Xeon Platinum 8160 (Skylake-SP)**, the development target for benchmarks.
+
+Everything below this banner is fork-specific, the original upstream README begins after the next horizontal rule.
+
+## Q1_0 / Q2_0 in this fork
+
+`Q1_0` stores 128 weights per block as 16 sign bytes plus one fp16 scale (each bit maps to ±d).
+`Q2_0` stores 128 weights per block as 32 bytes plus one fp16 scale, with the asymmetric encoding:
+`00 -> -d, 01 -> 0, 10 -> +d, 11 -> +2d`
+(not symmetric ternary, pure-ternary Microsoft Research BitNet kernels won't apply directly).
+
+Type plumbing is registered for both formats in `ggml-quants.h`, `ggml.c`, and the GGUF/converter side.
+CUDA, Metal, Vulkan, and SYCL backends have stubs, but the production-quality kernels live on the **CPU x86 backend** which is the focus of this fork for now.
+
+## x86 AVX-512 kernels and how to tune them
+
+Three orthogonal code paths are exposed as runtime-selectable variants. Defaults are auto-detected per micro-architecture, environment variables override at process start.
+
+### Phase 1 - single-row dot kernel (`ggml_vec_dot_q1_0_q8_0`)
+
+The hot path for any `Q1_0` tensor that doesn't get repacked (e.g. the embedding/output layers, or shapes that don't divide cleanly by 8 rows x 128 cols).
+
+| `GGML_Q1_0_DOT` | Path | Algorithm |
+|:---:|---|---|
+| `0` | AVX2 baseline | Legacy bit-decode chain (`set1` + `shuffle` + `and` + `cmpeq` + `xor` + `sub` -> `maddubs` + `madd` -> fmadd). Identical to the pre-fork x86 path, included as A/B baseline |
+| `1` | AVX-512VL EVEX-256 | Mask + biased VPSADBW. Per Q8_0 sub-block: `__mmask32` load, `q8u = q8 ^ 0x80`, `maskz_mov`, `sad_epu8`, hsum 4xi64, un-bias `−128·popcnt(m)`, `dot = 2·pos − sum_all` |
+| `2` | AVX-512BW ZMM-512 | Same identity, two Q8_0 sub-blocks per ZMM via `VINSERTI64X4`. Lanes 0–3 -> sub-block lo, 4–7 -> sub-block hi, each un-biased separately |
+
+Compile-time default `GGML_Q1_0_DOT_DEFAULT`:
+`1` on SKX-SP/SKX-X (`__tune_skylake_avx512__` and no VNNI/VBMI/VPOPCNTDQ),
+`2` on CLX/ICX/SPR/Zen4,
+`0` on AVX2-only systems.
+
+### Phase 2 - repacked GEMV (`ggml_gemv_q1_0_8x8_q8_0`)
+
+Engages automatically for token generation when the weight tensor satisfies `ne[1] % 8 == 0` and `ne[0] % 128 == 0`. Uses the new `block_q1_0x8` repack layout (8 rows interleaved per 128-column tile, K-major masks, 144 B/tile). Per-token `Σq8` per Q8_0 sub-block is precomputed once and reused across all 8 rows.
+
+| `GGML_Q1_0_GEMV` | Algorithm |
+|:---:|---|
+| `0` | Mask + biased-SAD, two rows per ZMM. `__mmask64` packs `(rp, rp+4)`. q8 broadcast via `VBROADCASTI64X4`; `VPMASKZ_MOV_EPI8` + `VPSADBW` per row pair |
+| `1` | Byte-LUT, q1-block-outer. Build 4 x 256 x `int16_t` LUTs per Q8_0 sub-block (8 KiB total in L1), pure scalar inner loop: 4 lookups + 3 adds per (row, sub-block). Best on SKX-SP because no VNNI/VBMI/VPOPCNTQ and ZMM frequency drop is steep |
+
+Compile-time default `GGML_Q1_0_GEMV_VARIANT`:
+`1` on SKX-SP, `0` elsewhere.
+
+### Phase 3 - repacked GEMM (`ggml_gemm_q1_0_8x8_q8_0`, R8xC4)
+
+Engages automatically for prompt processing (`batch ≥ 4`). Same `block_q1_0x8` layout. Activation-tile reuse across 4 columns is the structural win - row-pair masks, popcnts, and broadcast-q8 ZMMs are all amortised per column.
+
+| `GGML_Q1_0_GEMM` | Algorithm |
+|:---:|---|
+| `0` | Mask + biased-SAD R8xC4. Pre-broadcasts 4 columns' biased q8 per sub-block. Inner cost per (row pair, column) = one `VPMASKZ_MOV_EPI8` + one `VPSADBW` + scalar reduce |
+| `1` | Byte-LUT R8xC4. Four per-column LUTs per sub-block (32 KiB total - spills L1 on SKX, which is why mask/SAD usually wins for GEMM). Shipped because the flag was asked for and on a future µarch with cheaper gather it may flip |
+
+Compile-time default `GGML_Q1_0_GEMM_VARIANT`:
+`0` (mask/SAD wins on R8xC4 amortisation, even on SKX).
+
+### Summary of all flags
+
+| Compile-time macro | Runtime env var | Values | Path |
+|---|---|:---:|---|
+| `GGML_Q1_0_DOT_DEFAULT` | `GGML_Q1_0_DOT` | `0`, `1`, `2` | Single-row dot |
+| `GGML_Q1_0_GEMV_VARIANT` | `GGML_Q1_0_GEMV` | `0`, `1` | Repacked GEMV (token gen) |
+| `GGML_Q1_0_GEMM_VARIANT` | `GGML_Q1_0_GEMM` | `0`, `1` | Repacked GEMM (prompt) |
+
+Build-time defaults are auto-detected.
+Runtime env vars override and are read once per process via a benign-race init (or C++11 magic statics in the C++ TU).
+Both compile-time branches and all runtime variants are compiled into the same binary, so flipping flags requires no rebuild.
+
+### When does which path fire?
+
+```
+Token generation (batch = 1):
+    repackable tensor (ffn_*, attn_*):     GEMV   <- GGML_Q1_0_GEMV
+    non-repackable tensor (output, embed): DOT    <- GGML_Q1_0_DOT
+
+Prompt processing (batch >= 4):
+    repackable tensor:     GEMM   <- GGML_Q1_0_GEMM
+    non-repackable tensor: DOT    <- GGML_Q1_0_DOT (per token, looped)
+```
+
+## Benchmark grid
+
+Build once with `skylake-avx512` tune so the auto-defaults land correctly:
+
+```bash
+cmake -B build-avx512 -DGGML_NATIVE=ON \
+  -DCMAKE_C_FLAGS="-march=skylake-avx512" \
+  -DCMAKE_CXX_FLAGS="-march=skylake-avx512"
+cmake --build build-avx512 -j
+```
+
+### Round 1 - find the best DOT variant
+
+Lock GEMV/GEMM at the known-good baseline, sweep DOT.
+
+| Run | `GGML_Q1_0_DOT` | `GGML_Q1_0_GEMV` | `GGML_Q1_0_GEMM` |
+|:---:|:---:|:---:|:---:|
+| 1.a | `0` | `0` | `0` |
+| 1.b | `1` | `0` | `0` |
+| 1.c | `2` | `0` | `0` |
+
+```bash
+for D in 0 1 2; do
+  echo "=== DOT=$D GEMV=0 GEMM=0 ==="
+  GGML_Q1_0_DOT=$D GGML_Q1_0_GEMV=0 GGML_Q1_0_GEMM=0 \
+    ./build-avx512/bin/llama-bench -m bonsai-4b-q1_0.gguf -t 24 -p 256 -n 128
+done
+```
+
+Bench:
+    1.a vs 1.b shows whether EVEX-256 mask+SAD beats the AVX2 bit-decode (the core hypothesis).
+    1.b vs 1.c shows whether ZMM frequency drop on 8160 outweighs the 2x width.
+
+### Round 2 - re-confirm GEMV/GEMM with the new DOT
+
+Lock `DOT=W` (round-1 winner), sweep the 2x2 GEMV/GEMM grid.
+
+| Run | `GGML_Q1_0_DOT` | `GGML_Q1_0_GEMV` | `GGML_Q1_0_GEMM` |
+|:---:|:---:|:---:|:---:|
+| 2.a | `W` | `0` | `0` |
+| 2.b | `W` | `0` | `1` |
+| 2.c | `W` | `1` | `0` |
+| 2.d | `W` | `1` | `1` |
+
+```bash
+W=1   # replace with round-1 winner (0, 1, or 2)
+for V in 0 1; do for M in 0 1; do
+  echo "=== DOT=$W GEMV=$V GEMM=$M ==="
+  GGML_Q1_0_DOT=$W GGML_Q1_0_GEMV=$V GGML_Q1_0_GEMM=$M \
+    ./build-avx512/bin/llama-bench -m bonsai-4b-q1_0.gguf -t 24 -p 256 -n 128
+done; done
+```
+
+`-p 256 -n 128` records prompt-processing tok/s (PP, exercises GEMM + DOT) and token-generation tok/s (TG, exercises GEMV + DOT) per row.
+
+### Recording template
+
+| Run | DOT | GEMV | GEMM | PP (tok/s) | TG (tok/s) |
+|:---:|:---:|:---:|:---:|---:|---:|
+| 1.a | 0 | 0 | 0 | | |
+| 1.b | 1 | 0 | 0 | | |
+| 1.c | 2 | 0 | 0 | | |
+| 2.a | W | 0 | 0 | | |
+| 2.b | W | 0 | 1 | | |
+| 2.c | W | 1 | 0 | | |
+| 2.d | W | 1 | 1 | | |
+
+7 tests total.
+
+### Optional sanity check
+
+A separate AVX2-only build should match `DOT=0` in the AVX-512 build to within rounding:
+
+```bash
+cmake -B build-avx2 -DGGML_NATIVE=ON \
+  -DCMAKE_C_FLAGS="-march=haswell" \
+  -DCMAKE_CXX_FLAGS="-march=haswell"
+cmake --build build-avx2 -j
+./build-avx2/bin/llama-bench -m bonsai-4b-q1_0.gguf -t 24 -p 256 -n 128
+```
+
+If it doesn't match within a few percent, there's a bug in variant 0.
+
+## Files touched by this fork
+
+- `ggml/src/ggml-cpu/arch/x86/quants.c` - Phase 1 dot kernel, three runtime variants
+- `ggml/src/ggml-cpu/arch/x86/repack.cpp` - Phase 2/3 GEMV and GEMM, two runtime variants each
+- `ggml/src/ggml-cpu/repack.cpp` - `block_q1_0x8` traits, scalar reference GEMV/GEMM, dispatch hook
+- `ggml/src/ggml-cpu/repack.h` - `block_q1_0x8` struct, forward declarations
+- `ggml/src/ggml-cpu/arch-fallback.h` - `_generic` aliases for non-x86 architectures
+- `ggml-common.h`, `ggml-quants.h`, `ggml.c`, `gguf-py/` - `Q1_0` and `Q2_0` type plumbing
+
+---
+
+# Upstream llama.cpp README
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
@@ -23,9 +200,9 @@ LLM inference in C/C++
 - [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
 - Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
 - Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
+- VS Code extension for FIM completions: <https://github.com/ggml-org/llama.vscode>
+- Vim/Neovim plugin for FIM completions: <https://github.com/ggml-org/llama.vim>
+- Hugging Face Inference Endpoints now support GGUF out of the box! <https://github.com/ggml-org/llama.cpp/discussions/9669>
 - Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
 
 ----
@@ -262,6 +439,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 - [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
 - [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
   support"
+
 </details>
 
 <details>
@@ -270,7 +448,6 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 - [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
 
 </details>
-
 
 ## Supported backends
 
@@ -316,15 +493,15 @@ After downloading a model, use the CLI tools to run it locally - see below.
 The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
 
 - Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
-- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
-- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
-- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
+- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: <https://github.com/ggml-org/llama.cpp/discussions/10123>)
+- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: <https://github.com/ggml-org/llama.cpp/discussions/9268>)
+- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: <https://github.com/ggml-org/llama.cpp/discussions/9669>)
 
 To learn more about model quantization, [read this documentation](tools/quantize/README.md)
 
 ## [`llama-cli`](tools/cli)
 
-#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality.
+#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality
 
 - <details open>
     <summary>Run in conversation mode</summary>
@@ -367,14 +544,13 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     The [grammars/](grammars/) folder contains a handful of sample grammars. To write your own, check out the [GBNF Guide](grammars/README.md).
 
-    For authoring more complex JSON grammars, check out https://grammar.intrinsiclabs.ai/
+    For authoring more complex JSON grammars, check out <https://grammar.intrinsiclabs.ai/>
 
     </details>
 
-
 ## [`llama-server`](tools/server)
 
-#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
+#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs
 
 - <details open>
     <summary>Start a local HTTP server with default configuration on port 8080</summary>
@@ -441,10 +617,9 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     </details>
 
-
 ## [`llama-perplexity`](tools/perplexity)
 
-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
+#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text
 
 - <details open>
     <summary>Measure the perplexity over a text file</summary>
@@ -471,7 +646,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
 ## [`llama-bench`](tools/llama-bench)
 
-#### Benchmark the performance of the inference for various parameters.
+#### Benchmark the performance of the inference for various parameters
 
 - <details open>
     <summary>Run default benchmark</summary>
@@ -492,7 +667,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
 ## [`llama-simple`](examples/simple)
 
-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
+#### A minimal example for implementing apps with `llama.cpp`. Useful for developers
 
 - <details>
     <summary>Basic text completion</summary>
@@ -504,7 +679,6 @@ To learn more about model quantization, [read this documentation](tools/quantize
     ```
 
     </details>
-
 
 ## Contributing
 
@@ -535,19 +709,22 @@ To learn more about model quantization, [read this documentation](tools/quantize
 #### Seminal papers and background on the models
 
 If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
+
 - LLaMA:
-    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
-    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
+  - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
+  - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
 - GPT-3
-    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
+  - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
 - GPT-3.5 / InstructGPT / ChatGPT:
-    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
-    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
+  - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
+  - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
 
 ## XCFramework
+
 The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
 and macOS. It can be used in Swift projects without the need to compile the
 library from source. For example:
+
 ```swift
 // swift-tools-version: 5.10
 // The swift-tools-version declares the minimum version of Swift required to build this package.
@@ -570,21 +747,26 @@ let package = Package(
     ]
 )
 ```
+
 The above example is using an intermediate build `b5046` of the library. This can be modified
 to use a different version by changing the URL and checksum.
 
 ## Completions
+
 Command-line completion is available for some environments.
 
 #### Bash Completion
+
 ```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
+build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
+source ~/.llama-completion.bash
 ```
+
 Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
 automatically. For example:
+
 ```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+echo "source ~/.llama-completion.bash" >> ~/.bashrc
 ```
 
 ## Dependencies

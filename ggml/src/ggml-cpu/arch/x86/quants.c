@@ -22,34 +22,56 @@
 
 #define UNUSED GGML_UNUSED
 
-// Q1_0 AVX-512 width preference.
+// Q1_0 dot kernel variant selection.
 //
-// On Skylake-SP (e.g. Xeon 8160) heavy ZMM code triggers an AVX-512
-// frequency offset of ~600-900 MHz under sustained all-core load.
-// For a low-arithmetic-intensity 1-bit kernel that is often a net loss
-// vs. running two EVEX-encoded 256-bit passes, which keep the same
-// mask-register tricks via AVX-512VL but stay in the high-frequency
-// licence domain.
+// Benchmarks on Xeon 8160 showed gemv=0/gemm=0 (the existing dot path) wins
+// over the repacked GEMV/GEMM machinery, so the dot kernel itself is the
+// hot path. We expose three variants, all 2*pos - sum_all_q8 with biased
+// VPSADBW (no negate-then-maddubs chain), structured as 4 x 32-weight
+// chunks per Q1_0 block (one chunk per Q8_0 sub-block, scales line up):
 //
-// On Cascade Lake / Ice Lake-SP / Sapphire Rapids / Zen4 the ZMM
-// frequency penalty is much smaller (or zero), so the 512-bit path
-// wins. We therefore expose a single switch with conservative auto
-// defaults; users can override at compile time.
+//   GGML_Q1_0_DOT = 0  AVX2 bit-decode path (legacy x86 baseline)
+//   GGML_Q1_0_DOT = 1  AVX-512VL EVEX-256 mask + biased SAD
+//   GGML_Q1_0_DOT = 2  AVX-512BW ZMM-512  mask + biased SAD
 //
-//   GGML_Q1_0_PREFER_EVEX256 = 1  -> use 256-bit AVX-512VL kernel
-//   GGML_Q1_0_PREFER_EVEX256 = 0  -> use 512-bit ZMM kernel (default elsewhere)
-#ifndef GGML_Q1_0_PREFER_EVEX256
-  #if defined(__tune_skylake_avx512__) && \
-      !defined(__AVX512VNNI__) && !defined(__AVX512VBMI__) && \
-      !defined(__AVX512VPOPCNTDQ__)
-    // Pure SKX-SP/SKX-X target: no VNNI, no VBMI, no VPOPCNTQ.
-    // CLX adds VNNI; ICX adds VBMI/VPOPCNTQ; SPR adds AMX/etc.
-    // So "skylake-avx512 tune AND none of those flags" pinpoints SKX.
-    #define GGML_Q1_0_PREFER_EVEX256 1
+// Compile-time default: SKX-SP/SKX-X picks variant 1 (heavy ZMM is a loss
+// at this arithmetic intensity), everywhere else picks variant 2.
+// Runtime override: env var GGML_Q1_0_DOT={0,1,2}, read once per process.
+#ifndef GGML_Q1_0_DOT_DEFAULT
+  #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    #if defined(__tune_skylake_avx512__) && \
+        !defined(__AVX512VNNI__) && !defined(__AVX512VBMI__) && \
+        !defined(__AVX512VPOPCNTDQ__)
+      #define GGML_Q1_0_DOT_DEFAULT 1   // EVEX-256 on SKX-SP/SKX-X
+    #else
+      #define GGML_Q1_0_DOT_DEFAULT 2   // ZMM-512 on CLX/ICX/SPR/Zen4
+    #endif
   #else
-    #define GGML_Q1_0_PREFER_EVEX256 0
+    #define GGML_Q1_0_DOT_DEFAULT 0     // AVX2 baseline (no AVX-512)
   #endif
 #endif
+
+// Runtime variant resolution. C doesn't have C++11 magic statics, so we
+// use a benign-race init: multiple threads may all call getenv on the
+// first race window, but they all compute the same int and write it.
+static int q1_0_dot_variant_resolve(void) {
+    const char * e = getenv("GGML_Q1_0_DOT");
+    if (!e) return GGML_Q1_0_DOT_DEFAULT;
+    if (e[0] == '0' && e[1] == '\0') return 0;
+    if (e[0] == '1' && e[1] == '\0') return 1;
+    if (e[0] == '2' && e[1] == '\0') return 2;
+    return GGML_Q1_0_DOT_DEFAULT;
+}
+
+static int g_q1_0_dot_variant = -1;
+static inline int q1_0_dot_variant_get(void) {
+    int v = g_q1_0_dot_variant;
+    if (v < 0) {
+        v = q1_0_dot_variant_resolve();
+        g_q1_0_dot_variant = v;
+    }
+    return v;
+}
 
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
@@ -581,6 +603,32 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+// Helper: signed horizontal sum of 32 int8 lanes. Used by variants 1 and 2 to
+// compute sum_all_q8 once per Q8_0 sub-block. maddubs(ones_u8, q8_i8) -> i16
+// (no saturation since |q8|<=127), then madd against ones_i16 -> i32, then
+// final cross-lane reduce.
+static inline int q1_0_dot_signed_sum_i8_32(const int8_t * GGML_RESTRICT q) {
+    const __m256i v   = _mm256_loadu_si256((const __m256i *) q);
+    const __m256i s16 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
+    const __m256i s32 = _mm256_madd_epi16(s16, _mm256_set1_epi16(1));
+    __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(s32), _mm256_extracti128_si256(s32, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1,0,3,2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2,3,0,1)));
+    return _mm_cvtsi128_si32(lo);
+}
+
+// Helper: sum 4 i64 lanes of a __m256i to a scalar i64. Used to fold the
+// VPSADBW result (which produces 4 i64 partial sums for a 32-byte input)
+// down to one number per chunk.
+static inline int64_t q1_0_dot_hsum_i64x4(__m256i v) {
+    const __m128i a = _mm256_castsi256_si128(v);
+    const __m128i b = _mm256_extracti128_si256(v, 1);
+    const __m128i s = _mm_add_epi64(a, b);
+    return (int64_t) _mm_extract_epi64(s, 0) + (int64_t) _mm_extract_epi64(s, 1);
+}
+#endif
+
 void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;
     const int nb = n / qk;
@@ -596,92 +644,145 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q8_0 * GGML_RESTRICT y = vy;
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
-    // Phase 1 AVX-512 dot. Two variants: EVEX-256 (default on SKX-SP) and
-    // ZMM (default elsewhere). Both replace the AVX2 bit-decode chain
-    // (set1+shuffle+and+cmpeq+xor+sub) with a kreg load + masked subtract.
-    //
-    // q1_0 layout: 16 sign bytes per 128-weight block. Bit i = 1 means
-    // weight i = +d, bit i = 0 means -d. Eight q1 bytes form a __mmask64
-    // (or four bytes form a __mmask32) directly, no expansion needed.
-    //
-    // Per Q8_0 sub-block of 32 weights we form  s32[r] = sum signed-q8
-    // and FMA against the folded scale d0 * dy.
+    // Three variants compiled in; runtime-select via GGML_Q1_0_DOT={0,1,2}.
+    // Variant 0 keeps the existing AVX2 bit-decode chain as a baseline so
+    // we can A/B against the new SAD-based paths on the same binary.
+    // Variants 1/2 use the (2*pos - sum_all) identity with biased VPSADBW,
+    // structured as four 32-weight chunks per Q1 block (one chunk per Q8_0
+    // sub-block, scales line up naturally).
+    const int variant = q1_0_dot_variant_get();
 
-  #if GGML_Q1_0_PREFER_EVEX256
-    // ----- EVEX-256 variant -----
-    const __m256i ones_8  = _mm256_set1_epi8(1);
-    const __m256i ones_16 = _mm256_set1_epi16(1);
-    const __m256i zero_i8 = _mm256_setzero_si256();
-    __m256 acc = _mm256_setzero_ps();
+    if (variant == 1) {
+        // ===== Variant 1: AVX-512VL EVEX-256 mask + biased SAD =====
+        // Per Q8_0 sub-block (32 weights):
+        //   m32        = 32 sign bits loaded as __mmask32
+        //   q8         = 32 signed activation bytes
+        //   sum_all    = signed sum of q8 (computed once per sub-block)
+        //   q8u        = q8 ^ 0x80                       (u8 view for SAD)
+        //   sel        = maskz_mov(m32, q8u)
+        //   sum_pos_u  = sad(sel, 0) reduced             (unsigned, biased)
+        //   pos        = sum_pos_u - 128 * popcnt(m32)   (un-bias)
+        //   dot        = 2*pos - sum_all
+        //   total     += d0 * dy * dot
+        const __m256i bias = _mm256_set1_epi8((char) 0x80);
+        const __m256i zero = _mm256_setzero_si256();
+        float total = 0.0f;
+        for (int ib = 0; ib < nb; ++ib) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+            const block_q8_0 * GGML_RESTRICT yp = &y[ib * 4];
+            float chunk_sum = 0.0f;
+            for (int K = 0; K < 4; ++K) {
+                uint32_t mbits;
+                memcpy(&mbits, &x[ib].qs[K * 4], sizeof(mbits));
+                const __mmask32 m = (__mmask32) mbits;
 
-    for (int ib = 0; ib < nb; ++ib) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        const block_q8_0 * GGML_RESTRICT yp = &y[ib * 4];
-
-        for (int K = 0; K < 4; ++K) {
-            uint32_t mbits;
-            memcpy(&mbits, &x[ib].qs[K * 4], sizeof(mbits));
-            const __mmask32 m = (__mmask32) mbits;
-
-            const __m256i q8  = _mm256_loadu_si256((const __m256i *) yp[K].qs);
-            // negate q8 lanes where bit == 0
-            const __m256i sq8 = _mm256_mask_sub_epi8(q8, _knot_mask32(m), zero_i8, q8);
-
-            const __m256i s16 = _mm256_maddubs_epi16(ones_8, sq8);
-            const __m256i s32 = _mm256_madd_epi16(s16, ones_16);
-
-            const float   dy    = GGML_CPU_FP16_TO_FP32(yp[K].d);
-            const __m256  scale = _mm256_set1_ps(d0 * dy);
-            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32), scale, acc);
+                const __m256i q8       = _mm256_loadu_si256((const __m256i *) yp[K].qs);
+                const int     sum_all  = q1_0_dot_signed_sum_i8_32(yp[K].qs);
+                const __m256i q8u      = _mm256_xor_si256(q8, bias);
+                const __m256i sel      = _mm256_maskz_mov_epi8(m, q8u);
+                const __m256i sad      = _mm256_sad_epu8(sel, zero);
+                const int     sum_pos_u= (int) q1_0_dot_hsum_i64x4(sad);
+                const int     pos      = sum_pos_u - 128 * __builtin_popcount(mbits);
+                const int     dot      = 2 * pos - sum_all;
+                const float   dy       = GGML_CPU_FP16_TO_FP32(yp[K].d);
+                chunk_sum += dy * (float) dot;
+            }
+            total += d0 * chunk_sum;
         }
+        *s = total;
+        return;
     }
 
-    *s = hsum_float_8(acc);
-  #else
-    // ----- ZMM variant -----
-    const __m512i ones_8  = _mm512_set1_epi8(1);
-    const __m512i ones_16 = _mm512_set1_epi16(1);
-    const __m512i zero_i8 = _mm512_setzero_si512();
-    __m512 acc = _mm512_setzero_ps();
+    if (variant == 2) {
+        // ===== Variant 2: AVX-512BW ZMM-512 mask + biased SAD =====
+        // Process two Q8_0 sub-blocks (64 weights) per ZMM iteration.
+        // Q8_0 stride is 34 B so we VINSERTI64X4 two 32-byte halves.
+        const __m256i bias_256 = _mm256_set1_epi8((char) 0x80);
+        const __m512i zero_512 = _mm512_setzero_si512();
+        float total = 0.0f;
+        for (int ib = 0; ib < nb; ++ib) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+            const block_q8_0 * GGML_RESTRICT yp = &y[ib * 4];
+            float chunk_sum = 0.0f;
+            for (int P = 0; P < 2; ++P) {
+                uint64_t mbits;
+                memcpy(&mbits, &x[ib].qs[P * 8], sizeof(mbits));
+                const __mmask64 mm    = (__mmask64) mbits;
+                const uint32_t  m_lo  = (uint32_t) (mbits & 0xFFFFFFFFu);
+                const uint32_t  m_hi  = (uint32_t) (mbits >> 32);
 
-    for (int ib = 0; ib < nb; ++ib) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        const block_q8_0 * GGML_RESTRICT yp = &y[ib * 4];
+                const __m256i q8_lo  = _mm256_loadu_si256((const __m256i *) yp[P*2 + 0].qs);
+                const __m256i q8_hi  = _mm256_loadu_si256((const __m256i *) yp[P*2 + 1].qs);
+                const int     sum_l  = q1_0_dot_signed_sum_i8_32(yp[P*2 + 0].qs);
+                const int     sum_h  = q1_0_dot_signed_sum_i8_32(yp[P*2 + 1].qs);
 
-        // Process the 4 Q8_0 sub-blocks as 2 pairs of 2 sub-blocks.
-        // Each pair = 64 weights = one ZMM. Q8_0 stride is 34B so the two
-        // halves of the activation ZMM are assembled with VINSERTI64X4.
-        for (int P = 0; P < 2; ++P) {
-            uint64_t mbits;
-            memcpy(&mbits, &x[ib].qs[P * 8], sizeof(mbits));
-            const __mmask64 m = (__mmask64) mbits;
+                const __m256i q8u_lo = _mm256_xor_si256(q8_lo, bias_256);
+                const __m256i q8u_hi = _mm256_xor_si256(q8_hi, bias_256);
+                const __m512i q8u    = _mm512_inserti64x4(_mm512_castsi256_si512(q8u_lo), q8u_hi, 1);
 
-            const __m256i q8_lo = _mm256_loadu_si256((const __m256i *) yp[P*2 + 0].qs);
-            const __m256i q8_hi = _mm256_loadu_si256((const __m256i *) yp[P*2 + 1].qs);
-            const __m512i q8    = _mm512_inserti64x4(_mm512_castsi256_si512(q8_lo), q8_hi, 1);
+                const __m512i sel = _mm512_maskz_mov_epi8(mm, q8u);
+                const __m512i sad = _mm512_sad_epu8(sel, zero_512);
+                // sad has 8 i64 lanes; lanes 0-3 -> sub-block lo, 4-7 -> sub-block hi.
+                const int sum_pos_lo = (int) q1_0_dot_hsum_i64x4(_mm512_castsi512_si256(sad));
+                const int sum_pos_hi = (int) q1_0_dot_hsum_i64x4(_mm512_extracti64x4_epi64(sad, 1));
 
-            // negate where bit == 0
-            const __m512i sq8 = _mm512_mask_sub_epi8(q8, _knot_mask64(m), zero_i8, q8);
+                const int pos_lo = sum_pos_lo - 128 * __builtin_popcount(m_lo);
+                const int pos_hi = sum_pos_hi - 128 * __builtin_popcount(m_hi);
+                const int dot_lo = 2 * pos_lo - sum_l;
+                const int dot_hi = 2 * pos_hi - sum_h;
 
-            const __m512i s16 = _mm512_maddubs_epi16(ones_8, sq8);
-            const __m512i s32 = _mm512_madd_epi16(s16, ones_16);
-
-            // s32 lanes  0..7  -> sub-block P*2+0 (its own d_y)
-            // s32 lanes  8..15 -> sub-block P*2+1 (its own d_y)
-            const float dy_lo = GGML_CPU_FP16_TO_FP32(yp[P*2 + 0].d);
-            const float dy_hi = GGML_CPU_FP16_TO_FP32(yp[P*2 + 1].d);
-
-            // Build a 16-lane scale vector with d0*dy_lo in low 8, d0*dy_hi in high 8.
-            const __m256 scale_lo = _mm256_set1_ps(d0 * dy_lo);
-            const __m256 scale_hi = _mm256_set1_ps(d0 * dy_hi);
-            const __m512 scale    = _mm512_insertf32x8(_mm512_castps256_ps512(scale_lo), scale_hi, 1);
-
-            acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s32), scale, acc);
+                const float dy_lo = GGML_CPU_FP16_TO_FP32(yp[P*2 + 0].d);
+                const float dy_hi = GGML_CPU_FP16_TO_FP32(yp[P*2 + 1].d);
+                chunk_sum += dy_lo * (float) dot_lo;
+                chunk_sum += dy_hi * (float) dot_hi;
+            }
+            total += d0 * chunk_sum;
         }
+        *s = total;
+        return;
     }
 
-    *s = _mm512_reduce_add_ps(acc);
-  #endif
+    // ===== Variant 0: legacy AVX2 bit-decode path (baseline) =====
+    {
+        const __m256i ones_8 = _mm256_set1_epi8(1);
+        const __m256i ones_16 = _mm256_set1_epi16(1);
+        const __m256i byte_shuf = _mm256_setr_epi8(
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+        const __m256i bit_masks = _mm256_setr_epi8(
+                1, 2, 4, 8, 16, 32, 64, (char) -128, 1, 2, 4, 8, 16, 32, 64, (char) -128,
+                1, 2, 4, 8, 16, 32, 64, (char) -128, 1, 2, 4, 8, 16, 32, 64, (char) -128);
+        const __m256i zero = _mm256_setzero_si256();
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+            const uint32_t * GGML_RESTRICT qs32 = (const uint32_t *) x[ib].qs;
+            const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
+
+            __m256 acc_block;
+            {
+                const __m256i qy = _mm256_loadu_si256((const __m256i *) y_ptr[0].qs);
+                const __m256i sm = _mm256_cmpeq_epi8(
+                        _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) qs32[0]), byte_shuf), bit_masks), zero);
+                const __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(qy, sm), sm);
+                const __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy), ones_16);
+                acc_block = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[0].d)), _mm256_cvtepi32_ps(s32));
+            }
+            for (int K = 1; K < 4; ++K) {
+                const __m256i qy = _mm256_loadu_si256((const __m256i *) y_ptr[K].qs);
+                const __m256i sm = _mm256_cmpeq_epi8(
+                        _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) qs32[K]), byte_shuf), bit_masks), zero);
+                const __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(qy, sm), sm);
+                const __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy), ones_16);
+                acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[K].d)), _mm256_cvtepi32_ps(s32), acc_block);
+            }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+        }
+
+        *s = hsum_float_8(acc);
+        return;
+    }
 #elif defined(__AVX2__)
     const __m256i ones_8 = _mm256_set1_epi8(1);
     const __m256i ones_16 = _mm256_set1_epi16(1);
