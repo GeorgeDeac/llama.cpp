@@ -22,6 +22,35 @@
 
 #define UNUSED GGML_UNUSED
 
+// Q1_0 AVX-512 width preference.
+//
+// On Skylake-SP (e.g. Xeon 8160) heavy ZMM code triggers an AVX-512
+// frequency offset of ~600-900 MHz under sustained all-core load.
+// For a low-arithmetic-intensity 1-bit kernel that is often a net loss
+// vs. running two EVEX-encoded 256-bit passes, which keep the same
+// mask-register tricks via AVX-512VL but stay in the high-frequency
+// licence domain.
+//
+// On Cascade Lake / Ice Lake-SP / Sapphire Rapids / Zen4 the ZMM
+// frequency penalty is much smaller (or zero), so the 512-bit path
+// wins. We therefore expose a single switch with conservative auto
+// defaults; users can override at compile time.
+//
+//   GGML_Q1_0_PREFER_EVEX256 = 1  -> use 256-bit AVX-512VL kernel
+//   GGML_Q1_0_PREFER_EVEX256 = 0  -> use 512-bit ZMM kernel (default elsewhere)
+#ifndef GGML_Q1_0_PREFER_EVEX256
+  #if defined(__tune_skylake_avx512__) && \
+      !defined(__AVX512VNNI__) && !defined(__AVX512VBMI__) && \
+      !defined(__AVX512VPOPCNTDQ__)
+    // Pure SKX-SP/SKX-X target: no VNNI, no VBMI, no VPOPCNTQ.
+    // CLX adds VNNI; ICX adds VBMI/VPOPCNTQ; SPR adds AMX/etc.
+    // So "skylake-avx512 tune AND none of those flags" pinpoints SKX.
+    #define GGML_Q1_0_PREFER_EVEX256 1
+  #else
+    #define GGML_Q1_0_PREFER_EVEX256 0
+  #endif
+#endif
+
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
@@ -566,7 +595,94 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-#if defined(__AVX2__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    // Phase 1 AVX-512 dot. Two variants: EVEX-256 (default on SKX-SP) and
+    // ZMM (default elsewhere). Both replace the AVX2 bit-decode chain
+    // (set1+shuffle+and+cmpeq+xor+sub) with a kreg load + masked subtract.
+    //
+    // q1_0 layout: 16 sign bytes per 128-weight block. Bit i = 1 means
+    // weight i = +d, bit i = 0 means -d. Eight q1 bytes form a __mmask64
+    // (or four bytes form a __mmask32) directly, no expansion needed.
+    //
+    // Per Q8_0 sub-block of 32 weights we form  s32[r] = sum signed-q8
+    // and FMA against the folded scale d0 * dy.
+
+  #if GGML_Q1_0_PREFER_EVEX256
+    // ----- EVEX-256 variant -----
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i zero_i8 = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT yp = &y[ib * 4];
+
+        for (int K = 0; K < 4; ++K) {
+            uint32_t mbits;
+            memcpy(&mbits, &x[ib].qs[K * 4], sizeof(mbits));
+            const __mmask32 m = (__mmask32) mbits;
+
+            const __m256i q8  = _mm256_loadu_si256((const __m256i *) yp[K].qs);
+            // negate q8 lanes where bit == 0
+            const __m256i sq8 = _mm256_mask_sub_epi8(q8, _knot_mask32(m), zero_i8, q8);
+
+            const __m256i s16 = _mm256_maddubs_epi16(ones_8, sq8);
+            const __m256i s32 = _mm256_madd_epi16(s16, ones_16);
+
+            const float   dy    = GGML_CPU_FP16_TO_FP32(yp[K].d);
+            const __m256  scale = _mm256_set1_ps(d0 * dy);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32), scale, acc);
+        }
+    }
+
+    *s = hsum_float_8(acc);
+  #else
+    // ----- ZMM variant -----
+    const __m512i ones_8  = _mm512_set1_epi8(1);
+    const __m512i ones_16 = _mm512_set1_epi16(1);
+    const __m512i zero_i8 = _mm512_setzero_si512();
+    __m512 acc = _mm512_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT yp = &y[ib * 4];
+
+        // Process the 4 Q8_0 sub-blocks as 2 pairs of 2 sub-blocks.
+        // Each pair = 64 weights = one ZMM. Q8_0 stride is 34B so the two
+        // halves of the activation ZMM are assembled with VINSERTI64X4.
+        for (int P = 0; P < 2; ++P) {
+            uint64_t mbits;
+            memcpy(&mbits, &x[ib].qs[P * 8], sizeof(mbits));
+            const __mmask64 m = (__mmask64) mbits;
+
+            const __m256i q8_lo = _mm256_loadu_si256((const __m256i *) yp[P*2 + 0].qs);
+            const __m256i q8_hi = _mm256_loadu_si256((const __m256i *) yp[P*2 + 1].qs);
+            const __m512i q8    = _mm512_inserti64x4(_mm512_castsi256_si512(q8_lo), q8_hi, 1);
+
+            // negate where bit == 0
+            const __m512i sq8 = _mm512_mask_sub_epi8(q8, _knot_mask64(m), zero_i8, q8);
+
+            const __m512i s16 = _mm512_maddubs_epi16(ones_8, sq8);
+            const __m512i s32 = _mm512_madd_epi16(s16, ones_16);
+
+            // s32 lanes  0..7  -> sub-block P*2+0 (its own d_y)
+            // s32 lanes  8..15 -> sub-block P*2+1 (its own d_y)
+            const float dy_lo = GGML_CPU_FP16_TO_FP32(yp[P*2 + 0].d);
+            const float dy_hi = GGML_CPU_FP16_TO_FP32(yp[P*2 + 1].d);
+
+            // Build a 16-lane scale vector with d0*dy_lo in low 8, d0*dy_hi in high 8.
+            const __m256 scale_lo = _mm256_set1_ps(d0 * dy_lo);
+            const __m256 scale_hi = _mm256_set1_ps(d0 * dy_hi);
+            const __m512 scale    = _mm512_insertf32x8(_mm512_castps256_ps512(scale_lo), scale_hi, 1);
+
+            acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s32), scale, acc);
+        }
+    }
+
+    *s = _mm512_reduce_add_ps(acc);
+  #endif
+#elif defined(__AVX2__)
     const __m256i ones_8 = _mm256_set1_epi8(1);
     const __m256i ones_16 = _mm256_set1_epi16(1);
     const __m256i byte_shuf = _mm256_setr_epi8(

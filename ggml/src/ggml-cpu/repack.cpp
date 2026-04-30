@@ -3859,6 +3859,96 @@ static int repack_mxfp4_to_mxfp4_8_bl(struct ggml_tensor * t, int interleave_blo
     GGML_UNUSED(data_size);
 }
 
+// =============================================================================
+// Q1_0_8x8: scalar/generic reference implementations and repack helper.
+// AVX-512-tuned variants live in arch/x86/repack.cpp.
+// =============================================================================
+
+static int repack_q1_0_to_q1_0_8x8(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q1_0);
+    constexpr int nrows_interleaved = 8;
+
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK1_0;
+
+    GGML_ASSERT(data_size == (size_t) nrow * (size_t) nblocks * sizeof(block_q1_0));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK1_0 != 0) {
+        return -1;
+    }
+
+    block_q1_0x8 *       dst = (block_q1_0x8 *) t->data;
+    const block_q1_0 *   src = (const block_q1_0 *) data;
+
+    for (int64_t b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; ++x) {
+            block_q1_0x8 out;
+            for (int r = 0; r < nrows_interleaved; ++r) {
+                const block_q1_0 & sb = src[(b + r) * nblocks + x];
+                out.d[r] = sb.d;
+                // 16 sign bytes -> 4 x uint32_t, indexed by sub-block k = 0..3.
+                uint32_t mk[4];
+                memcpy(mk, sb.qs, 16);
+                for (int k = 0; k < 4; ++k) out.m[k][r] = mk[k];
+            }
+            *dst++ = out;
+        }
+    }
+    return 0;
+}
+
+void ggml_gemv_q1_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    UNUSED(bs);
+    UNUSED(nr);
+
+    assert(n  % QK1_0 == 0);
+    assert(nc % 8     == 0);
+
+    const int nb      = n / QK1_0;
+    const int nrtiles = nc / 8;
+
+    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    for (int t = 0; t < nrtiles; ++t) {
+        const block_q1_0x8 * GGML_RESTRICT x = (const block_q1_0x8 *) vx + (size_t) t * nb;
+        float acc[8] = {0,0,0,0,0,0,0,0};
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const block_q1_0x8 * GGML_RESTRICT blk = &x[ib];
+            float d_w[8];
+            for (int r = 0; r < 8; ++r) d_w[r] = GGML_CPU_FP16_TO_FP32(blk->d[r]);
+
+            for (int k = 0; k < 4; ++k) {
+                const int8_t * GGML_RESTRICT q = y[ib*4 + k].qs;
+                const float    dyk = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+
+                int sum_q8 = 0;
+                for (int i = 0; i < 32; ++i) sum_q8 += q[i];
+
+                for (int r = 0; r < 8; ++r) {
+                    const uint32_t m = blk->m[k][r];
+                    int pos = 0;
+                    for (int i = 0; i < 32; ++i) {
+                        if ((m >> i) & 1u) pos += q[i];
+                    }
+                    const int dot = 2 * pos - sum_q8;
+                    acc[r] += d_w[r] * dyk * (float) dot;
+                }
+            }
+        }
+
+        for (int r = 0; r < 8; ++r) s[t * 8 + r] = acc[r];
+    }
+}
+
+void ggml_gemm_q1_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const size_t row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, (int64_t) n);
+    for (int i = 0; i < nr; ++i) {
+        const char * yi = (const char *) vy + (size_t) i * row_size_q8;
+        ggml_gemv_q1_0_8x8_q8_0_generic(n, s + (size_t) i * bs, bs, vx, yi, 1, nc);
+    }
+}
+
 namespace ggml::cpu::repack {
 // repack
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
@@ -3932,6 +4022,10 @@ template <> int repack<block_q8_0, 4, 4>(struct ggml_tensor * t, const void * da
 
 template <> int repack<block_q8_0, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q8_0_to_q8_0_4_bl(t, 8, data, data_size);
+}
+
+template <> int repack<block_q1_0, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q1_0_to_q1_0_8x8(t, data, data_size);
 }
 
 #if defined __riscv_zvfh
@@ -4031,6 +4125,10 @@ template <> void gemv<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemv_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_q1_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q1_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 #if defined __riscv_zvfh
 template <> void gemv<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4074,6 +4172,10 @@ void gemm<block_q4_0, 8, 8, GGML_TYPE_Q8_0>(int          n,
                                             int          nr,
                                             int          nc) {
     ggml_gemm_q4_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_q1_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q1_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 template <> void gemm<block_q2_K, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
@@ -4558,6 +4660,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
 
+    // instance for Q1_0 (Bonsai 1-bit)
+    static const ggml::cpu::repack::tensor_traits<block_q1_0, 8, 8, GGML_TYPE_Q8_0> q1_0_8x8_q8_0;
+
     // instances for RISC-V
     //
     // These implement outer-product style matrix multiplication kernels with
@@ -4569,6 +4674,16 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 1, 16, GGML_TYPE_Q8_0> q8_0_16x1_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q2_K, 1, 16, GGML_TYPE_Q8_K> q2_K_16x1_q8_K;
 #endif
+
+    if (cur->type == GGML_TYPE_Q1_0) {
+        // Q1_0_8x8 is x86-only for now (AVX-512 and AVX2 fallback paths in
+        // arch/x86/repack.cpp + scalar generic in repack.cpp). The repack
+        // requires 8 rows interleaved and 128-wide column blocks.
+        if (ggml_cpu_has_avx2() && cur->ne[1] % 8 == 0 && cur->ne[0] % QK1_0 == 0) {
+            return &q1_0_8x8_q8_0;
+        }
+        return nullptr;
+    }
 
     if (cur->type == GGML_TYPE_Q4_0) {
         if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {

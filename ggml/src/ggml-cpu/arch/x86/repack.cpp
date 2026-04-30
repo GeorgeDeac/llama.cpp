@@ -6405,3 +6405,399 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
+
+// =============================================================================
+// Q1_0_8x8 kernels (Bonsai-style 1-bit weights, 8 rows interleaved)
+// =============================================================================
+//
+// Weight tile (block_q1_0x8): 144 B = 8 fp16 row scales + 4*8 32-bit row masks.
+// Activation row: standard Q8_0 (32 i8 + fp16 scale per sub-block).
+//
+// The math identity used by both variants:
+//
+//     dot_r = sum_i sign_r,i * q8_i
+//           = 2 * sum_{i : bit_r,i = 1} q8_i  -  sum_i q8_i
+//
+// `sum_i q8_i` (per Q8_0 sub-block) is precomputed once and reused across
+// all 8 rows of the tile -- that is the structural win vs. the single-row
+// dot kernel. Per-row work is then just "selected positive sum".
+//
+// Two implementation variants per kernel, selectable at compile time AND at
+// runtime via env vars:
+//
+//   variant 0 : mask + biased VPSADBW    (Phase 2A; needs AVX-512BW)
+//   variant 1 : byte-LUT q1-block-outer  (Phase 2B; pure scalar inner loop,
+//                                         best on SKX-SP -- no VNNI/VBMI/
+//                                         VPOPCNTQ, ZMM frequency penalty)
+//
+// Compile-time defaults:
+//   -DGGML_Q1_0_GEMV_VARIANT={0,1}
+//   -DGGML_Q1_0_GEMM_VARIANT={0,1}
+// Auto-detects SKX-SP via __tune_skylake_avx512__ and prefers LUT there.
+//
+// Runtime overrides (read once per process):
+//   GGML_Q1_0_GEMV={0,1}
+//   GGML_Q1_0_GEMM={0,1}
+
+#ifndef GGML_Q1_0_GEMV_VARIANT
+  #if defined(__tune_skylake_avx512__) && \
+      !defined(__AVX512VNNI__) && !defined(__AVX512VBMI__) && \
+      !defined(__AVX512VPOPCNTDQ__)
+    #define GGML_Q1_0_GEMV_VARIANT 1   // byte-LUT
+  #else
+    #define GGML_Q1_0_GEMV_VARIANT 0   // mask/biased-SAD
+  #endif
+#endif
+
+#ifndef GGML_Q1_0_GEMM_VARIANT
+  // GEMM tends to favour mask/SAD even on SKX because the activation tile is
+  // reused across 4 columns -- the SIMD work amortises better. But we still
+  // honour SKX preference if the user explicitly opts in to LUT.
+  #if defined(__tune_skylake_avx512__) && \
+      !defined(__AVX512VNNI__) && !defined(__AVX512VBMI__) && \
+      !defined(__AVX512VPOPCNTDQ__)
+    #define GGML_Q1_0_GEMM_VARIANT 0   // mask/biased-SAD (R8xC4 reuse helps)
+  #else
+    #define GGML_Q1_0_GEMM_VARIANT 0   // mask/biased-SAD
+  #endif
+#endif
+
+// One-time env-var override resolution. C++11 magic statics give us
+// thread-safe single init for free.
+static int q1_0_resolve_variant_env(const char * env_name, int compile_default) {
+    const char * v = std::getenv(env_name);
+    if (!v) return compile_default;
+    if (v[0] == '0' && v[1] == '\0') return 0;
+    if (v[0] == '1' && v[1] == '\0') return 1;
+    return compile_default;
+}
+
+static inline int q1_0_get_gemv_variant(void) {
+    static const int v = q1_0_resolve_variant_env("GGML_Q1_0_GEMV", GGML_Q1_0_GEMV_VARIANT);
+    return v;
+}
+
+static inline int q1_0_get_gemm_variant(void) {
+    static const int v = q1_0_resolve_variant_env("GGML_Q1_0_GEMM", GGML_Q1_0_GEMM_VARIANT);
+    return v;
+}
+
+// Build a per-byte LUT: lut[p] = sum_{b in p} q[b], for each of 256 8-bit
+// patterns. Standard Brian-Kernighan recurrence: one add per non-zero entry.
+static inline void ggml_q1_0_build_byte_lut_i16(const int8_t * GGML_RESTRICT q, int16_t * GGML_RESTRICT lut) {
+    lut[0] = 0;
+    for (int p = 1; p < 256; ++p) {
+        const unsigned lsb = (unsigned) p & (unsigned) -p;
+        const int b = __builtin_ctz(lsb);
+        lut[p] = (int16_t) (lut[p ^ (int) lsb] + q[b]);
+    }
+}
+
+// Sum a 32-byte signed-int8 vector to a 32-bit scalar.
+// Cannot use VPSADBW directly on signed bytes; pair maddubs+madd works at AVX2.
+static inline int32_t ggml_q1_0_hsum_i8_32(const int8_t * GGML_RESTRICT q) {
+#if defined(__AVX2__)
+    const __m256i v   = _mm256_loadu_si256((const __m256i *) q);
+    const __m256i s16 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);   // ones * v -> i16
+    const __m256i s32 = _mm256_madd_epi16(s16, _mm256_set1_epi16(1));
+    __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(s32), _mm256_extracti128_si256(s32, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1,0,3,2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2,3,0,1)));
+    return _mm_cvtsi128_si32(lo);
+#else
+    int32_t s = 0;
+    for (int i = 0; i < 32; ++i) s += q[i];
+    return s;
+#endif
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// Horizontal sum of 4 i64 lanes in a __m256i. Used to fold the SAD per-half
+// reduction down to a scalar before the un-bias step.
+static inline int64_t ggml_q1_0_hsum_i64x4(__m256i v) {
+    const __m128i lo = _mm256_castsi256_si128(v);
+    const __m128i hi = _mm256_extracti128_si256(v, 1);
+    const __m128i s  = _mm_add_epi64(lo, hi);
+    return (int64_t) _mm_extract_epi64(s, 0) + (int64_t) _mm_extract_epi64(s, 1);
+}
+#endif
+
+// Caps on the precomputed-q8 scratch arrays.
+//   GEMV:  one row, so 8 KiB stack budget (covers n up to 65536)
+//   GEMM:  four rows, so we cap tighter to keep stack within 16 KiB
+//          (covers n up to 16384, which is past any current transformer FFN)
+// Falls back to per-row generic above the cap.
+enum { Q1_0_MAX_NB_Q8      = 2048 };
+enum { Q1_0_GEMM_MAX_NB_Q8 = 512  };
+
+void ggml_gemv_q1_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    UNUSED(bs);
+    UNUSED(nr);
+
+    assert(n  % QK1_0 == 0);
+    assert(nc % 8     == 0);
+
+    const int nb      = n / QK1_0;             // q1 blocks per row
+    const int nrtiles = nc / 8;                // 8-row output tiles
+    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int n_q8 = nb * 4;
+    if (n_q8 > Q1_0_MAX_NB_Q8) {
+        ggml_gemv_q1_0_8x8_q8_0_generic(n, s, 0, vx, vy, nr, nc);
+        return;
+    }
+
+    // Precompute per-Q8_0-sub-block scales and integer sums; reused across
+    // every row tile, so we pay this once per gemv call.
+    float   dy [Q1_0_MAX_NB_Q8];
+    int32_t sq8[Q1_0_MAX_NB_Q8];
+    for (int k = 0; k < n_q8; ++k) {
+        dy [k] = GGML_CPU_FP16_TO_FP32(y[k].d);
+        sq8[k] = ggml_q1_0_hsum_i8_32(y[k].qs);
+    }
+
+    const int variant = q1_0_get_gemv_variant();
+
+    for (int t = 0; t < nrtiles; ++t) {
+        const block_q1_0x8 * GGML_RESTRICT x = (const block_q1_0x8 *) vx + (size_t) t * nb;
+        float acc[8] = {0,0,0,0,0,0,0,0};
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        if (variant == 0) {
+            // ---- Mask + biased-SAD variant ----
+            // Two rows per ZMM via __mmask64 packing of (rp, rp+4).
+            const __m512i zero_512 = _mm512_setzero_si512();
+            const __m256i bias_256 = _mm256_set1_epi8((char) 0x80);
+            for (int ib = 0; ib < nb; ++ib) {
+                const block_q1_0x8 * GGML_RESTRICT blk = &x[ib];
+                float d_w[8];
+                for (int r = 0; r < 8; ++r) d_w[r] = GGML_CPU_FP16_TO_FP32(blk->d[r]);
+
+                for (int k = 0; k < 4; ++k) {
+                    const __m256i q8_256  = _mm256_loadu_si256((const __m256i *) y[ib*4 + k].qs);
+                    const __m256i q8u_256 = _mm256_xor_si256(q8_256, bias_256);
+                    const __m512i q8u_512 = _mm512_broadcast_i64x4(q8u_256);
+
+                    const float dyk = dy [ib*4 + k];
+                    const int   sk  = sq8[ib*4 + k];
+
+                    for (int rp = 0; rp < 4; ++rp) {
+                        const uint32_t m_lo = blk->m[k][rp];
+                        const uint32_t m_hi = blk->m[k][rp + 4];
+                        const __mmask64 mm  = (__mmask64) m_lo | ((__mmask64) m_hi << 32);
+
+                        const __m512i sel = _mm512_maskz_mov_epi8(mm, q8u_512);
+                        const __m512i sad = _mm512_sad_epu8(sel, zero_512);
+
+                        const int sum_lo = (int) ggml_q1_0_hsum_i64x4(_mm512_castsi512_si256(sad));
+                        const int sum_hi = (int) ggml_q1_0_hsum_i64x4(_mm512_extracti64x4_epi64(sad, 1));
+
+                        const int pos_lo = sum_lo - 128 * __builtin_popcount(m_lo);
+                        const int pos_hi = sum_hi - 128 * __builtin_popcount(m_hi);
+
+                        const int dot_lo = 2 * pos_lo - sk;
+                        const int dot_hi = 2 * pos_hi - sk;
+
+                        acc[rp]     += d_w[rp]     * dyk * (float) dot_lo;
+                        acc[rp + 4] += d_w[rp + 4] * dyk * (float) dot_hi;
+                    }
+                }
+            }
+        } else
+#endif
+        {
+            // ---- Byte-LUT variant: q1-block-outer ----
+            // Always available. On AVX2-only x86 this is the only fast path.
+            alignas(64) int16_t lut[4][4][256];
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const block_q1_0x8 * GGML_RESTRICT blk = &x[ib];
+
+                for (int k = 0; k < 4; ++k) {
+                    const int8_t * GGML_RESTRICT q = y[ib*4 + k].qs;
+                    ggml_q1_0_build_byte_lut_i16(q +  0, lut[k][0]);
+                    ggml_q1_0_build_byte_lut_i16(q +  8, lut[k][1]);
+                    ggml_q1_0_build_byte_lut_i16(q + 16, lut[k][2]);
+                    ggml_q1_0_build_byte_lut_i16(q + 24, lut[k][3]);
+                }
+
+                for (int r = 0; r < 8; ++r) {
+                    const float d_w = GGML_CPU_FP16_TO_FP32(blk->d[r]);
+                    float row_acc = 0.0f;
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t m = blk->m[k][r];
+                        const int pos =
+                              (int) lut[k][0][(m >>  0) & 0xff]
+                            + (int) lut[k][1][(m >>  8) & 0xff]
+                            + (int) lut[k][2][(m >> 16) & 0xff]
+                            + (int) lut[k][3][(m >> 24) & 0xff];
+                        const int dot = 2 * pos - sq8[ib*4 + k];
+                        row_acc += dy[ib*4 + k] * (float) dot;
+                    }
+                    acc[r] += d_w * row_acc;
+                }
+            }
+        }
+
+        for (int r = 0; r < 8; ++r) s[t * 8 + r] = acc[r];
+    }
+}
+
+// =============================================================================
+// R8 x C4 GEMM: 4 activation columns reused across 8 output rows per tile.
+// =============================================================================
+//
+// Mask/SAD path: per (q1 block, sub-block) the row-pair masks and popcnts are
+// computed ONCE and reused across all 4 columns. The 4 column activations are
+// pre-broadcast to ZMM (one VPSHUFD-class op each) and held in registers.
+// Inner work per (rp, c) = one VPMASKZ_MOV + one VPSADBW + scalar reduce.
+//
+// LUT path: build 4 per-column LUTs per sub-block (32 KiB total per sub-block;
+// L1 = 32 KiB on SKX, so the LUTs spill to L2 -- which is why mask/SAD usually
+// wins for GEMM. We still ship it because (a) flag-selectable was the ask and
+// (b) on a future uarch with cheaper VPGATHER it may flip.)
+
+void ggml_gemm_q1_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n  % QK1_0 == 0);
+    assert(nc % 8     == 0);
+    assert(nr % 4     == 0);
+
+    const int    nb          = n / QK1_0;
+    const int    nrtiles     = nc / 8;
+    const size_t row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, (int64_t) n);
+
+    const int n_q8 = nb * 4;
+    if (n_q8 > Q1_0_GEMM_MAX_NB_Q8) {
+        // Fallback: walk one activation row at a time through GEMV
+        for (int i = 0; i < nr; ++i) {
+            const char * yi = (const char *) vy + (size_t) i * row_size_q8;
+            ggml_gemv_q1_0_8x8_q8_0(n, s + (size_t) i * bs, bs, vx, yi, 1, nc);
+        }
+        return;
+    }
+
+    const int variant = q1_0_get_gemm_variant();
+
+    // Process 4 activation rows at a time (R8 x C4 tile).
+    for (int ar = 0; ar < nr; ar += 4) {
+        const block_q8_0 * yc[4];
+        for (int c = 0; c < 4; ++c) {
+            yc[c] = (const block_q8_0 *) ((const char *) vy + (size_t) (ar + c) * row_size_q8);
+        }
+
+        // Precompute per-(col, sub-block) scales and signed sums once.
+        // Layout: [col][sub-block index] -- contiguous per col so cache-friendly.
+        float   dy_c [4][Q1_0_GEMM_MAX_NB_Q8];
+        int32_t sq8_c[4][Q1_0_GEMM_MAX_NB_Q8];
+        for (int c = 0; c < 4; ++c) {
+            for (int k = 0; k < n_q8; ++k) {
+                dy_c [c][k] = GGML_CPU_FP16_TO_FP32(yc[c][k].d);
+                sq8_c[c][k] = ggml_q1_0_hsum_i8_32(yc[c][k].qs);
+            }
+        }
+
+        for (int t = 0; t < nrtiles; ++t) {
+            const block_q1_0x8 * GGML_RESTRICT x = (const block_q1_0x8 *) vx + (size_t) t * nb;
+            float acc[4][8] = {{0}};   // [col][row]
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            if (variant == 0) {
+                // ---- Mask + biased-SAD R8xC4 GEMM ----
+                const __m512i zero_512 = _mm512_setzero_si512();
+                const __m256i bias_256 = _mm256_set1_epi8((char) 0x80);
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const block_q1_0x8 * GGML_RESTRICT blk = &x[ib];
+                    float d_w[8];
+                    for (int r = 0; r < 8; ++r) d_w[r] = GGML_CPU_FP16_TO_FP32(blk->d[r]);
+
+                    for (int k = 0; k < 4; ++k) {
+                        // Pre-broadcast all 4 columns' biased q8 -> 4 ZMMs
+                        __m512i q8u_512[4];
+                        for (int c = 0; c < 4; ++c) {
+                            const __m256i q  = _mm256_loadu_si256((const __m256i *) yc[c][ib*4 + k].qs);
+                            const __m256i qu = _mm256_xor_si256(q, bias_256);
+                            q8u_512[c] = _mm512_broadcast_i64x4(qu);
+                        }
+
+                        for (int rp = 0; rp < 4; ++rp) {
+                            const uint32_t m_lo = blk->m[k][rp];
+                            const uint32_t m_hi = blk->m[k][rp + 4];
+                            const __mmask64 mm  = (__mmask64) m_lo | ((__mmask64) m_hi << 32);
+                            // Popcnt is per-row, not per-column: compute once,
+                            // reuse across all 4 columns.
+                            const int pop_lo = __builtin_popcount(m_lo);
+                            const int pop_hi = __builtin_popcount(m_hi);
+
+                            for (int c = 0; c < 4; ++c) {
+                                const __m512i sel = _mm512_maskz_mov_epi8(mm, q8u_512[c]);
+                                const __m512i sad = _mm512_sad_epu8(sel, zero_512);
+
+                                const int sum_lo = (int) ggml_q1_0_hsum_i64x4(_mm512_castsi512_si256(sad));
+                                const int sum_hi = (int) ggml_q1_0_hsum_i64x4(_mm512_extracti64x4_epi64(sad, 1));
+
+                                const int pos_lo = sum_lo - 128 * pop_lo;
+                                const int pos_hi = sum_hi - 128 * pop_hi;
+
+                                const int   sk    = sq8_c[c][ib*4 + k];
+                                const float dyk   = dy_c [c][ib*4 + k];
+                                const int   dot_l = 2 * pos_lo - sk;
+                                const int   dot_h = 2 * pos_hi - sk;
+
+                                acc[c][rp]     += d_w[rp]     * dyk * (float) dot_l;
+                                acc[c][rp + 4] += d_w[rp + 4] * dyk * (float) dot_h;
+                            }
+                        }
+                    }
+                }
+            } else
+#endif
+            {
+                // ---- Byte-LUT R8xC4 GEMM ----
+                // Build 4 LUTs (one per column) per sub-block, sweep all 8
+                // rows x 4 cols against them.
+                alignas(64) int16_t lut_c[4][4][256];   // [col][bytepos][pattern]
+
+                for (int ib = 0; ib < nb; ++ib) {
+                    const block_q1_0x8 * GGML_RESTRICT blk = &x[ib];
+
+                    for (int k = 0; k < 4; ++k) {
+                        for (int c = 0; c < 4; ++c) {
+                            const int8_t * GGML_RESTRICT q = yc[c][ib*4 + k].qs;
+                            ggml_q1_0_build_byte_lut_i16(q +  0, lut_c[c][0]);
+                            ggml_q1_0_build_byte_lut_i16(q +  8, lut_c[c][1]);
+                            ggml_q1_0_build_byte_lut_i16(q + 16, lut_c[c][2]);
+                            ggml_q1_0_build_byte_lut_i16(q + 24, lut_c[c][3]);
+                        }
+
+                        for (int r = 0; r < 8; ++r) {
+                            const float    d_w = GGML_CPU_FP16_TO_FP32(blk->d[r]);
+                            const uint32_t m   = blk->m[k][r];
+                            const int      b0  = (m >>  0) & 0xff;
+                            const int      b1  = (m >>  8) & 0xff;
+                            const int      b2  = (m >> 16) & 0xff;
+                            const int      b3  = (m >> 24) & 0xff;
+
+                            for (int c = 0; c < 4; ++c) {
+                                const int pos =
+                                      (int) lut_c[c][0][b0]
+                                    + (int) lut_c[c][1][b1]
+                                    + (int) lut_c[c][2][b2]
+                                    + (int) lut_c[c][3][b3];
+                                const int   dot = 2 * pos - sq8_c[c][ib*4 + k];
+                                const float dyk = dy_c [c][ib*4 + k];
+                                acc[c][r] += d_w * dyk * (float) dot;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Store 4 cols x 8 rows into the destination strip.
+            for (int c = 0; c < 4; ++c) {
+                float * dst = s + (size_t) (ar + c) * bs + (size_t) t * 8;
+                for (int r = 0; r < 8; ++r) dst[r] = acc[c][r];
+            }
+        }
+    }
+}
