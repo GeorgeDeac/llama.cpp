@@ -164,6 +164,32 @@ cmake --build build-avx2 -j
 
 If it doesn't match within a few percent, there's a bug in variant 0.
 
+## Performance results
+
+Results for **Intel Xeon Platinum 8160 (Skylake-SP)**:
+
+Phase 1:
+DOT=0 GEMV=0 GEMM=0  -> 22.29 tok/s, TTFT 0.38s, total 6.23s
+DOT=1 GEMV=0 GEMM=0  -> 20.67 tok/s, TTFT 0.39s, total 6.59s
+DOT=2 GEMV=0 GEMM=0  -> 20.35 tok/s, TTFT 0.38s, total 6.68s
+
+DOT=0 won phase 1 by about:
++7.8% vs DOT=1
++9.5% vs DOT=2
+
+Concurrency pressure:
+DOT=0  conc1 19.6 tok/s  conc12 38.1 tok/s  p50@12 80.64s  ttft_p95@12 5.85s
+DOT=1  conc1 19.4 tok/s  conc12 36.8 tok/s  p50@12 83.37s  ttft_p95@12 6.72s
+DOT=2  conc1 19.2 tok/s  conc12 37.2 tok/s  p50@12 82.53s  ttft_p95@12 7.24s
+
+Phase 2:
+DOT=0 GEMV=0 GEMM=0  -> 21.76 tok/s
+DOT=0 GEMV=0 GEMM=1  -> 19.66 tok/s, but TTFT jumps badly
+DOT=0 GEMV=1 GEMM=0  ->  1.26 tok/s
+DOT=0 GEMV=1 GEMM=1  ->  1.32 tok/s
+
+Winner: DOT=0 GEMV=0 GEMM=0 for Skylake-SP.
+
 ## Files touched by this fork
 
 - `ggml/src/ggml-cpu/arch/x86/quants.c` - Phase 1 dot kernel, three runtime variants
