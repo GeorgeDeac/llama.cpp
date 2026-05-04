@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <cstdlib>
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
@@ -4662,6 +4663,10 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 
     // instance for Q1_0 (Bonsai 1-bit)
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 8, 8, GGML_TYPE_Q8_0> q1_0_8x8_q8_0;
+    static const bool q1_0_repack_enabled = [] {
+        const char * env = std::getenv("GGML_Q1_0_REPACK");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
 
     // instances for RISC-V
     //
@@ -4676,6 +4681,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 #endif
 
     if (cur->type == GGML_TYPE_Q1_0) {
+        if (!q1_0_repack_enabled) {
+            return nullptr;
+        }
         // Q1_0_8x8 is x86-only for now (AVX-512 and AVX2 fallback paths in
         // arch/x86/repack.cpp + scalar generic in repack.cpp). The repack
         // requires 8 rows interleaved and 128-wide column blocks.
