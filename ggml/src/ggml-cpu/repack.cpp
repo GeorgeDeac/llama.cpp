@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstdio>  // for GGML_ASSERT
+#include <type_traits>
 
 #include "repack.h"
 
@@ -4393,6 +4394,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
+        // Q1_0_8x8's GEMM expects plain block_q8_0 rows for the activation,
+        // not the interleaved block_q8_0x4 layout that ggml_quantize_mat_t<8,
+        // Q8_0> produces (which is shaped for q4_0_8x8's GEMM). Use a single
+        // per-row from_float for every src1 row when BLOC_TYPE==block_q1_0.
+        constexpr bool use_interleaved_quant = !std::is_same_v<BLOC_TYPE, block_q1_0>;
+
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
@@ -4400,14 +4407,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
-            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
-            }
+            if constexpr (use_interleaved_quant) {
+                for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+                                                                (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+                }
 
-            const int64_t i11_processed = ne11 - ne11 % 4;
-            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                const int64_t i11_processed = ne11 - ne11 % 4;
+                for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+                    from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                }
+            } else {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                }
             }
         }
 
